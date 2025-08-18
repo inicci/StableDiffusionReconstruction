@@ -41,7 +41,7 @@ def main():
     if not os.path.exists(f'{savedir}/{subject}_stims.npy'):
         np.save(f'{savedir}/{subject}_stims.npy',stims_all)
         np.save(f'{savedir}/{subject}_stims_ave.npy',stims_unique)
-
+    #betas_all = None
     for i in range(1,38):
         print(i)
         beta_trial = nsda.read_betas(subject=subject, 

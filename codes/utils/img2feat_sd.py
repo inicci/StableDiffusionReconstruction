@@ -116,10 +116,10 @@ def main():
                     c = model.get_learned_conditioning(prompt).mean(axis=0).unsqueeze(0)
 
                     # encode (scaled latent)
-                    z_enc = sampler.stochastic_encode(init_latent, torch.tensor([t_enc]*batch_size).to(device))
+                    #z_enc = sampler.stochastic_encode(init_latent, torch.tensor([t_enc]*batch_size).to(device))
                     # decode it
-                    samples = sampler.decode(z_enc, c, t_enc, unconditional_guidance_scale=scale,
-                                            unconditional_conditioning=uc,)
+                    #samples = sampler.decode(z_enc, c, t_enc, unconditional_guidance_scale=scale,
+                     #                       unconditional_conditioning=uc,)
                     
         init_latent = init_latent.cpu().detach().numpy().flatten()
         c = c.cpu().detach().numpy().flatten()

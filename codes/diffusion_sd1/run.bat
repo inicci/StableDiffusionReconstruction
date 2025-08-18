@@ -1,0 +1,1 @@
+for /L %%i in (1,1,10) do python diffusion_decoding.py --imgidx %%i --gpu 0 --subject subj01 --method cvpr

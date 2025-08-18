@@ -5,6 +5,8 @@ from torchvision import transforms
 from models.blip import blip_decoder
 import sys
 sys.path.append("../../util/")
+import os, sys
+sys.path.append(os.path.abspath(os.path.join(__file__, '..', '..', '..', 'utils')))
 from nsd_access.nsda import NSDAccess
 from tqdm import tqdm
 import numpy as np
