@@ -44,6 +44,45 @@ def load_img_from_arr(img_arr):
     image = image[None].transpose(0, 3, 1, 2)
     image = torch.from_numpy(image)
     return 2.*image - 1.
+def _ensure_1x77x768(x):
+    if isinstance(x, np.ndarray):
+        x = torch.from_numpy(x)
+    if x.dim() == 1:
+        x = x.view(1, 77, 768)
+    elif x.dim() == 2:
+        x = x.unsqueeze(0)
+    return x
+
+def apply_perdim_affine(c, args, device, eps=1e-6):
+    # 没开校准直接返回（保持原行为）
+    if not hasattr(args, "calib") or args.calib == "none":
+        return c
+
+    if args.calib == "ridge":
+        data = np.load(args.calib_npz)
+        w = data["w"]; b = data["b"]  # 59136 或 (77,768)
+        w = torch.from_numpy(w).float().to(device)
+        b = torch.from_numpy(b).float().to(device)
+        if w.dim() == 1: w = w.view(77,768)
+        if b.dim() == 1: b = b.view(77,768)
+        return c * w.unsqueeze(0) + b.unsqueeze(0)
+
+    if args.calib == "stats":
+        sp = np.load(args.stats_pred)  # mu,std
+        st = np.load(args.stats_tgt)
+        mu_p = torch.from_numpy(sp["mu"]).float().to(device)
+        sd_p = torch.from_numpy(sp["std"]).float().to(device)
+        mu_t = torch.from_numpy(st["mu"]).float().to(device)
+        sd_t = torch.from_numpy(st["std"]).float().to(device)
+        if mu_p.dim() == 1: mu_p = mu_p.view(77,768)
+        if sd_p.dim() == 1: sd_p = sd_p.view(77,768)
+        if mu_t.dim() == 1: mu_t = mu_t.view(77,768)
+        if sd_t.dim() == 1: sd_t = sd_t.view(77,768)
+        w = (sd_t / (sd_p + eps)).unsqueeze(0)
+        b = (mu_t - w[0] * mu_p).unsqueeze(0)
+        return c * w + b
+
+    return c
 
 def main():
 
@@ -80,7 +119,31 @@ def main():
         type=str,
         help="cvpr or text or gan",
     )
-
+    parser.add_argument(
+    "--calib",
+    type=str,
+    default="none",
+    choices=["none", "stats", "ridge"],
+    help="Per-dimension diagonal affine: none | stats | ridge",
+    )
+    parser.add_argument(
+    "--calib_npz",
+    type=str,
+    default=None,
+    help="Path to npz containing 'w' and 'b' for ridge calibration.",
+    )
+    parser.add_argument(
+    "--stats_pred",
+    type=str,
+    default=None,
+    help="Path to npz containing 'mu' and 'std' for predicted c (stats mode).",
+    )
+    parser.add_argument(
+    "--stats_tgt",
+    type=str,
+    default=None,
+    help="Path to npz containing 'mu' and 'std' for target text-encoder c (stats mode).",
+    )
     # Set parameters
     opt = parser.parse_args()
     seed_everything(opt.seed)
@@ -133,7 +196,7 @@ def main():
     outdir = f'../../decoded/image-{method}/{subject}/'
     os.makedirs(outdir, exist_ok=True)
 
-    sample_path = os.path.join(outdir, f"samples")
+    sample_path = os.path.join(outdir, f"samples1")
     os.makedirs(sample_path, exist_ok=True)
     precision = 'autocast'
     device = torch.device(f"cuda:{gpu}") if torch.cuda.is_available() else torch.device("cpu")
@@ -157,60 +220,72 @@ def main():
         scores_latent = np.load(f'../../decoded/{subject}/{subject}_{roi_latent}_scores_init_latent.npy')
         imgarr = torch.Tensor(scores_latent[imgidx,:].reshape(4,40,40)).unsqueeze(0).to('cuda')
 
-        # Generate image from Z
-        precision_scope = autocast if precision == "autocast" else nullcontext
-        with torch.no_grad():
-            with precision_scope("cuda"):
-                with model.ema_scope():
-                    x_samples = model.decode_first_stage(imgarr)
-                    x_samples = torch.clamp((x_samples + 1.0) / 2.0, min=0.0, max=1.0)
+        # -------- Generate preview image from z0 (optional, just to form init_image) --------
+    precision_scope = autocast if precision == "autocast" else nullcontext
+    with torch.no_grad():
+        with precision_scope("cuda"):
+            with model.ema_scope():
+                x_samples = model.decode_first_stage(imgarr)  # (B,3,H,W) in [-1,1]
+                preview = 255.*rearrange(x_samples[0].cpu().numpy(),'c h w -> h w c')
+                Image.fromarray(preview.astype(np.uint8)).save(os.path.join(sample_path, f"{imgidx:05}_zonly.png"))#保存Z only
+                x_samples = torch.clamp((x_samples + 1.0) / 2.0, min=0.0, max=1.0)  # [0,1]
+                # 取第 0 张构造 init image（你原来循环后只用最后一张，这里显式取第 0 张）
+                x0 = 255. * rearrange(x_samples[0].cpu().numpy(), 'c h w -> h w c')
+    im = Image.fromarray(x0.astype(np.uint8)).resize((512, 512))
+    im = np.array(im)
 
-                    for x_sample in x_samples:
-                        x_sample = 255. * rearrange(x_sample.cpu().numpy(), 'c h w -> h w c')
-        im = Image.fromarray(x_sample.astype(np.uint8)).resize((512,512))
-        im = np.array(im)
-
-    elif method == 'gan':
+    # 如果 method=='gan'，从文件读入初始图像覆盖
+    if method == 'gan':
         ganpath = f'{gandir}/recon_image_normalized-VGG19-fc8-{subject}-streams-{imgidx:06}.tiff'
         im = Image.open(ganpath).resize((512,512))
         im = np.array(im)
 
-    init_image = load_img_from_arr(im).to('cuda')
-    init_latent = model.get_first_stage_encoding(model.encode_first_stage(init_image))  # move to latent space
+    # 得到 init_latent（image-to-image 的起点）
+    init_image = load_img_from_arr(im).to(device)
+    init_latent = model.get_first_stage_encoding(model.encode_first_stage(init_image))  # (B,4,40,40)
 
-    # Load c (Semantics)
+    # -------- Load c (Semantics) --------
     if method == 'cvpr':
         roi_c = 'ventral'
         scores_c = np.load(f'../../decoded/{subject}/{subject}_{roi_c}_scores_c.npy')
-        carr = scores_c[imgidx,:].reshape(77,768)
-        c = torch.Tensor(carr).unsqueeze(0).to('cuda')
-    elif method in ['text','gan']:
-        captions = pd.read_csv(f'{captdir}/captions_brain.csv', sep='\t',header=None)
-        c = model.get_learned_conditioning(captions.iloc[imgidx][0]).to('cuda')
+        carr = scores_c[imgidx, :].reshape(77, 768)
+        c = torch.tensor(carr, dtype=torch.float32, device=device).unsqueeze(0)  # (1,77,768)
+    elif method in ['text', 'gan']:
+        captions = pd.read_csv(f'{captdir}/captions_brain.csv', sep='\t', header=None)
+        c = model.get_learned_conditioning(captions.iloc[imgidx][0]).to(device)  # (1,77,768)
 
-    # Generate image from Z (image) + C (semantics)
+    # ---- (NEW) 逐维对角仿射校准（如果你已加了函数/参数，不想校准就会是 no-op） ----
+    c = _ensure_1x77x768(c)                 # 统一成 (1,77,768)
+    c = apply_perdim_affine(c, opt, device) # opt.calib: "none"/"stats"/"ridge"
+
+    # ------- Sampling from z_enc with semantic conditioning c -------
     base_count = 0
+    uc = model.get_learned_conditioning(batch_size * [""]).to(device)  # 放循环外更高效
     with torch.no_grad():
         with precision_scope("cuda"):
             with model.ema_scope():
-                for n in trange(n_iter, desc="Sampling"):
-                    uc = model.get_learned_conditioning(batch_size * [""])
-
+                for _ in trange(n_iter, desc="Sampling"):
                     # encode (scaled latent)
-                    z_enc = sampler.stochastic_encode(init_latent, torch.tensor([t_enc]*batch_size).to(device))
+                    z_enc = sampler.stochastic_encode(
+                        init_latent, torch.tensor([t_enc] * batch_size, device=device)
+                    )
                     # decode it
-                    samples = sampler.decode(z_enc, c, t_enc, unconditional_guidance_scale=scale,
-                                            unconditional_conditioning=uc,)
+                    samples = sampler.decode(
+                        z_enc, c, t_enc,
+                        unconditional_guidance_scale=scale,
+                        unconditional_conditioning=uc,
+                    )
+                    x_samples = model.decode_first_stage(samples)  # [-1,1]
+                    x_samples = torch.clamp((x_samples + 1.0) / 2.0, min=0.0, max=1.0)  # [0,1]
 
-                    x_samples = model.decode_first_stage(samples)
-                    x_samples = torch.clamp((x_samples + 1.0) / 2.0, min=0.0, max=1.0)
-
-                    for x_sample in x_samples:
-                        x_sample = 255. * rearrange(x_sample.cpu().numpy(), 'c h w -> h w c')
-                    Image.fromarray(x_sample.astype(np.uint8)).save(
-                        os.path.join(sample_path, f"{imgidx:05}_{base_count:03}.png"))    
-                    base_count += 1
-
+                    # 保存 batch 内所有图；通常 batch_size=1
+                    for b in range(x_samples.shape[0]):
+                        x_np = 255. * rearrange(x_samples[b].cpu().numpy(), 'c h w -> h w c')
+                        Image.fromarray(x_np.astype(np.uint8)).save(
+                            os.path.join(sample_path, f"{imgidx:05}_{base_count:03}.png")
+                        )
+                        base_count += 1
+   
 
 if __name__ == "__main__":
     main()
